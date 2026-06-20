@@ -1,0 +1,32 @@
+services:
+  mcp-news:
+    build: ./mcp-news
+    container_name: mcp-news
+    expose:
+      - "8000"
+    networks:
+      - hermes-net
+    restart: unless-stopped
+
+  hermes-agent:
+    build: ./vendor/hermes-agent
+    image: hermes-agent
+    container_name: hermes
+    env_file: .env
+    depends_on:
+      - mcp-news
+    networks:
+      - hermes-net
+    volumes:
+      - hermes-data:/opt/data
+      - ./hermes/config.yaml:/opt/data/config.yaml
+      - ./hermes/skills/news-digest:/opt/data/skills/news-digest
+    command: ["gateway", "run"]
+    restart: unless-stopped
+
+networks:
+  hermes-net:
+    driver: bridge
+
+volumes:
+  hermes-data:

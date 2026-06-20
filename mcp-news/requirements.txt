@@ -1,0 +1,4 @@
+fastmcp>=2.10
+httpx>=0.27
+trafilatura>=1.8
+lxml>=5.0

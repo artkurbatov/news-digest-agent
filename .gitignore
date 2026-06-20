@@ -1,0 +1,14 @@
+.env
+
+vendor/
+
+hermes-data/
+.hermes/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+*.log
+.DS_Store
