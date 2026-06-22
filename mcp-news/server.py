@@ -2,7 +2,7 @@
 mcp-news — MCP-сервер для дайджеста новостей с Хабра.
 
 Инструменты:
-  - search_habr(query, period, limit) — ищет статьи через RSS поиска Хабра.
+  - search_habr(query, period, limit) — ищет статьи через API Хабра.
   - fetch_article(url)                — достаёт полный текст статьи.
 
 Транспорт: streamable HTTP на 0.0.0.0:8000, endpoint /mcp.
@@ -12,8 +12,6 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
-from xml.etree import ElementTree as ET
 
 import httpx
 import trafilatura
@@ -25,7 +23,12 @@ log = logging.getLogger("mcp-news")
 mcp = FastMCP("mcp-news")
 
 USER_AGENT = "Mozilla/5.0 (compatible; news-digest-bot/1.0; +https://example.org)"
-HABR_RSS_SEARCH = "https://habr.com/ru/rss/search/posts/"
+HABR_API_SEARCH = "https://habr.com/kek/v2/articles/"
+HABR_API_HEADERS = {
+    "Accept": "application/json",
+    "x-app-version": "2.325.7",
+    "User-Agent": USER_AGENT,
+}
 TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
 
 
@@ -64,13 +67,9 @@ def _parse_period(period: str) -> tuple[datetime, datetime]:
 
 
 def _parse_dt(value: str | None) -> datetime | None:
-    """Парсит дату из RSS (RFC-2822) или ISO-формата в aware-datetime UTC."""
+    """Парсит ISO-дату в aware-datetime UTC."""
     if not value:
         return None
-    try:
-        return parsedate_to_datetime(value).astimezone(timezone.utc)
-    except Exception:
-        pass
     try:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -103,7 +102,7 @@ def _strip_tags(text: str) -> str:
 
 @mcp.tool
 def search_habr(query: str, period: str = "7d", limit: int = 5) -> dict:
-    """Ищет статьи на Хабре по теме за указанный период через RSS.
+    """Ищет статьи на Хабре по теме за указанный период через API.
 
     Используй этот инструмент ПЕРВЫМ, когда пользователь просит дайджест/обзор
     новостей по теме. Полный текст статей берётся отдельно через fetch_article.
@@ -124,47 +123,71 @@ def search_habr(query: str, period: str = "7d", limit: int = 5) -> dict:
     limit = max(1, min(int(limit), 5))
     start, end = _parse_period(period)
 
-    xml_text = _http_get(
-        HABR_RSS_SEARCH,
-        params={"q": query, "order_by": "date", "target_type": "posts", "hl": "ru", "fl": "ru"},
-    )
-    if not xml_text:
-        return {"period_start": start.strftime("%d.%m.%Y"), "period_end": end.strftime("%d.%m.%Y"), "articles": []}
-
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as exc:
-        log.error("Не удалось разобрать RSS: %s", exc)
-        return {"period_start": start.strftime("%d.%m.%Y"), "period_end": end.strftime("%d.%m.%Y"), "articles": []}
-
-    ns = {"dc": "http://purl.org/dc/elements/1.1/"}
     results: list[dict] = []
+    page = 1
+    stop = False
 
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        url = (item.findtext("link") or "").strip()
-        pub_str = item.findtext("pubDate") or item.findtext("dc:date", namespaces=ns)
-        published = _parse_dt(pub_str)
+    while not stop and len(results) < limit:
+        try:
+            with httpx.Client(
+                timeout=TIMEOUT,
+                headers=HABR_API_HEADERS,
+                follow_redirects=True,
+            ) as client:
+                resp = client.get(
+                    HABR_API_SEARCH,
+                    params={"query": query, "order": "date", "fl": "ru", "hl": "ru",
+                            "page": page, "perPage": 20},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as exc:
+            log.error("Ошибка запроса к API Хабра: %s", exc)
+            break
 
-        if published and not (start <= published <= end):
-            continue
+        refs = data.get("publicationRefs") or {}
+        if not refs:
+            break
 
-        description = item.findtext("description") or ""
-        snippet = _strip_tags(description)[:300]
-        author = (item.findtext("dc:creator", namespaces=ns) or "").strip()
+        items = sorted(refs.values(), key=lambda x: x.get("timePublished", ""), reverse=True)
 
-        if not url:
-            continue
+        for item in items:
+            pub_str = item.get("timePublished")
+            published = _parse_dt(pub_str)
 
-        results.append({
-            "title": title,
-            "url": url.split("?")[0],
-            "published_at": published.isoformat() if published else None,
-            "author": author,
-            "source": "habr.com",
-            "snippet": snippet,
-        })
-        if len(results) >= limit:
+            if published and published > end:
+                continue
+
+            if published and published < start:
+                stop = True
+                break
+
+            article_id = item.get("id", "")
+            url = f"https://habr.com/ru/articles/{article_id}/"
+
+            title = _strip_tags(item.get("titleHtml") or "")
+
+            author_data = item.get("author") or {}
+            author = (author_data.get("fullname") or author_data.get("alias") or "").strip()
+
+            lead = item.get("leadData") or {}
+            snippet = _strip_tags(lead.get("textHtml") or "")[:300]
+
+            results.append({
+                "title": title,
+                "url": url,
+                "published_at": published.isoformat() if published else None,
+                "author": author,
+                "source": "habr.com",
+                "snippet": snippet,
+            })
+
+            if len(results) >= limit:
+                stop = True
+                break
+
+        page += 1
+        if page > 10:
             break
 
     log.info("search_habr(query=%r, period=%r) -> %d статей", query, period, len(results))
