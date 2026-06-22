@@ -7,14 +7,20 @@ services:
     networks:
       - hermes-net
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.socket(); s.connect(('localhost', 8000)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   hermes-agent:
-    build: ./vendor/hermes-agent
-    image: hermes-agent
+    image: nousresearch/hermes-agent:latest
     container_name: hermes
     env_file: .env
     depends_on:
-      - mcp-news
+      mcp-news:
+        condition: service_healthy
     networks:
       - hermes-net
     volumes:
